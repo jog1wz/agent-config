@@ -1,0 +1,1339 @@
+# Workflow Authoring Guide
+
+Complete reference for creating and modifying Conductor workflow YAML files.
+
+## Workflow Configuration
+
+```yaml
+workflow:
+  name: my-workflow              # Required: unique identifier
+  description: What it does      # Optional
+  version: "1.0.0"               # Optional
+  entry_point: first_agent       # Required: starting agent, parallel group, or for-each group
+
+  runtime:
+    provider: copilot            # copilot (default), openai, claude, claude-agent-sdk, hermes (experimental)
+    default_model: gpt-5.2       # Default model for agents
+    temperature: 0.7             # 0.0-1.0 (optional)
+    max_tokens: 4096             # Max output tokens per response (optional)
+    timeout: 600                 # Per-request timeout in seconds (optional)
+    max_agent_iterations: 50     # Max tool-use roundtrips per agent (1-500, optional)
+    max_session_seconds: 120     # Wall-clock timeout per agent session (optional)
+    default_reasoning_effort: medium  # Workflow-wide reasoning effort: low, medium, high, xhigh, max (optional)
+    skills: [conductor]              # Skills available to every provider-backed agent (optional)
+    checkpoint:                  # Periodic checkpoints for resumable stalled runs (optional, off by default)
+      every_agent: true          #   save after each step boundary (governs alone when true)
+      every_seconds: 300         #   throttle by elapsed seconds (used only when every_agent is false)
+      keep_last: 5               #   retain this many periodic checkpoints per run (1-100)
+
+  input:                         # Define workflow inputs
+    param_name:
+      type: string               # string, number, boolean, array, object
+      required: true
+      default: "value"
+      description: What it is
+
+  context:
+    mode: accumulate             # accumulate, last_only, explicit
+
+  limits:
+    max_iterations: 10           # Max agent executions (default: 10, max: 500)
+    timeout_seconds: 600         # Total workflow timeout (optional, no default)
+
+  cost:
+    show_per_agent: true         # Show cost per agent (default: true)
+    show_summary: true           # Show cost summary (default: true)
+    pricing:                     # Custom pricing overrides
+      custom-model:
+        input_per_mtok: 3.0
+        output_per_mtok: 15.0
+
+
+  metadata:                      # Optional arbitrary key-values surfaced in workflow_started events
+    tracker: ado
+    work_item_id: 42
+    # Merged with --metadata / -m CLI flags (CLI wins on key collision)
+
+  instructions:                  # Optional workspace context prepended to every agent prompt
+    - !file ../AGENTS.md         # !file include
+    - "Always respond in English."  # Inline string
+    # For workflows distributed via registry, prefer the --workspace-instructions
+    # CLI flag (auto-discovers AGENTS.md / CLAUDE.md / .github/copilot-instructions.md
+    # / .github/instructions/**/*.instructions.md with applyTo: "**") so target-repo
+    # context is loaded at run time instead of being baked into the YAML.
+```
+
+### Periodic Checkpoints (`runtime.checkpoint`)
+
+Off by default — Conductor otherwise checkpoints only on failure, so a *stalled*
+long run (provider hang, MCP deadlock, sub-agent that never returns) leaves
+nothing to `conductor resume`. Enable periodic checkpoints to make stalled or
+hard-killed runs recoverable:
+
+- `every_agent: true` — save at every step boundary. Governs alone when true
+  (`every_seconds` is then ignored).
+- `every_seconds: N` — throttle: save at the first boundary past N seconds since
+  the last save (set either trigger or both; a save fires when **either** is
+  met). The first save of a run fires at the first boundary; the interval only
+  throttles later saves.
+- `keep_last` (default 5) — rotate older periodic checkpoints for the run;
+  failure checkpoints are never rotated.
+
+Semantics: checkpoints are taken at step boundaries (all prior outputs
+committed) and point at the step *about to run*, so resume continues forward and
+re-runs only that step. No background timer — if a step runs longer than
+`every_seconds`, the recovery point is the boundary checkpoint taken before it
+started. Root workflow only (sub-workflows re-run from scratch on resume), and
+periodic checkpoints are deleted automatically at a terminal non-resumable
+outcome (clean completion or explicit `status: failed` terminate). A failed
+periodic save never interrupts the run — it emits a `checkpoint_save_failed`
+event + console warning. See
+`examples/periodic-checkpoints.yaml`.
+
+## Agent Definition
+
+```yaml
+agents:
+  - name: my_agent               # Required: unique identifier
+    type: agent                  # agent (default), human_gate, script, workflow, wait, terminate, or mcp
+    description: What it does
+    model: gpt-5.2               # Override workflow default
+    provider: claude             # Optional: per-agent provider override
+
+    system_prompt: |             # Optional: system message (always included)
+      You are a specialized assistant.
+
+    prompt: |
+      You are a helpful assistant.
+
+      Input: {{ workflow.input.param }}
+
+      {% if other_agent is defined and other_agent.output %}
+      Previous output: {{ other_agent.output.field }}
+      {% endif %}
+
+    output:                      # Structured output schema
+      field_name:
+        type: string
+        description: What this field contains
+
+    tools:                       # null = all, [] = none, [list] = subset
+      - web_search
+
+    max_agent_iterations: 100    # Override workflow default for this agent (optional)
+    max_session_seconds: 60      # Wall-clock timeout for this agent (optional, soft, between iterations)
+    session_key: investigation   # Optional. Executions sharing this key continue ONE provider
+                                 # session. Static label, never rendered. claude-agent-sdk only.
+    timeout_seconds: 120         # Hard wall-clock cancellation for this agent (provider-backed only).
+                                 # Engine wraps execution in asyncio.wait_for(); raises AgentTimeoutError.
+                                 # Effective limit = min(timeout_seconds, remaining_workflow_timeout).
+                                 # Non-retryable. Forbidden on script/human_gate/workflow/wait types.
+
+    retry:                       # Per-agent retry policy (optional, not allowed on script/human_gate/workflow/wait)
+      max_attempts: 3            # 1-10, default 1 (no retry)
+      backoff: exponential       # exponential (default) or fixed
+      delay_seconds: 2.0         # Base delay (0-300, default 2.0)
+      retry_on:                  # Default: ["provider_error", "timeout"]
+        - provider_error         # API 500s, rate limits
+        - timeout                # Agent-level timeout exceeded
+                                 # Validation errors are never retried.
+
+    dialog:                      # Optional: conditionally pause for free-form conversation (optional)
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about the user's
+        intent or needs clarification on ambiguous requirements.
+
+    reasoning:                   # Override runtime.default_reasoning_effort (optional)
+      effort: high               # low, medium, high, xhigh, or max
+
+    skills: [conductor]          # Skills this agent has access to (optional, tri-state)
+                                 # Omit = inherit runtime.skills; [] = explicit opt-out;
+                                 # [name, ...] = explicit set. Not allowed on
+                                 # script/human_gate/workflow/wait/set/terminate agents.
+
+    validator:                   # Optional: grade output, re-run once on failure
+      criteria: |                # Required: rubric the output is checked against
+        Verify every issue has an actionable suggestion and no
+        function names are fabricated.
+      model: claude-sonnet-4-5   # Optional: defaults to the agent's model
+      max_retries: 1             # 0 or 1 (default 1; hard-capped at 1)
+
+    routes:                      # Where to go next
+      - to: next_agent
+```
+
+### Reasoning Effort
+
+`reasoning.effort` (per-agent) and `runtime.default_reasoning_effort` (workflow-wide) accept `low`, `medium`, `high`, `xhigh`, or `max`. Per-agent overrides the runtime default. The provider translates the unified value to its native API:
+
+- **Copilot**: forwarded as `reasoning_effort` on the session. Validated against the model's advertised `supported_reasoning_efforts`; raises `ValidationError` for unsupported combinations (skipped in mock-handler mode or when capability metadata is absent).
+- **Claude**: enables extended thinking via `thinking={"type": "enabled", "budget_tokens": N}` with mapping `low=2048`, `medium=8192`, `high=16384`, `xhigh=32768`, `max=59904`. Auto-coerces `temperature` to `1.0` (logged at INFO) and bumps `max_tokens` to fit `budget + 4096` (capped at 64000, logged at INFO when clamped). Only valid on thinking-capable models (`claude-3-7-*`, `claude-opus-4*`, `claude-sonnet-4*`, `claude-haiku-4*`); raises `ValidationError` otherwise.
+- **Hermes**: forwarded to the hermes-agent library via `reasoning_config={"effort": value}`. Support depends on the underlying model and hermes version. `max` is **not** offered on Hermes (its four-level tuple omits it); the provider re-checks the resolved effort against that tuple at execute time in addition to the static `conductor validate` cross-check, so `max` is rejected both statically and at runtime (including when a templated `effort` only resolves to `max` after rendering).
+
+Both providers surface reasoning content via `agent_reasoning` events visible in the dashboard, JSONL logs, and the console at `-vv`. Not allowed on `script`, `human_gate`, `workflow`, or `wait` agent types.
+
+```yaml
+runtime:
+  provider: claude
+  default_model: claude-opus-4-20250514
+  default_reasoning_effort: medium    # workflow-wide default
+
+agents:
+  - name: explainer
+    prompt: "Explain this algorithm."
+    # inherits 'medium'
+
+  - name: architect
+    reasoning:
+      effort: high                    # override
+    prompt: "Design the system architecture."
+```
+
+See `examples/reasoning-effort.yaml` for a complete example.
+
+### Validator (semantic output validation)
+
+`validator.criteria` (required) is graded by a **second LLM call** after the agent completes, returning `{passed, issues}`. On `passed: false` and `max_retries > 0` (default `1`, hard-capped at `1`; `0` = report-only), the agent re-runs once with a `## Validation feedback` section (the issues) appended to its prompt; the second output is final (no second validation loop). `validator.model` defaults to the agent's model.
+
+Distinct from `retry:` (transient failures, same prompt) and `output:` (shape/type, not content). Provider-backed `agent` steps only (not `script`, `human_gate`, `workflow`, `wait`, `set`, `terminate`); works in the main loop, parallel groups, and for-each loops. **Fail-open** — validator errors / unparseable responses are treated as a pass with a logged warning, so a flaky grader never blocks the workflow. Validator (and any discarded first attempt) token cost is reported as a separate `<agent> (validator)` usage row. Emits `agent_validator_start`, `agent_validator_complete`, and `agent_validation_failed` events (surfaced in the dashboard and at `-vv`).
+
+```yaml
+agents:
+  - name: code_reviewer
+    model: claude-sonnet-4-5
+    prompt: "Review the diff for bugs.\n{{ workflow.input.diff }}"
+    output:
+      summary: { type: string }
+      issues:  { type: array }
+    validator:
+      criteria: |
+        Verify the review identifies all null-safety issues, every suggestion
+        is actionable, and no function names are fabricated.
+      max_retries: 1
+```
+
+See `examples/validator.yaml` for a complete example.
+
+### Skills
+
+`skills` enables reusable knowledge or capability bundles for provider-backed agents. The Conductor distribution ships one built-in skill — `conductor` — which packages the YAML schema, execution model, and authoring patterns (the same content this reference doc covers) so an agent can evaluate, improve, debug, or generate Conductor workflows.
+
+**Names and paths.** Each entry is either a registered built-in name or a filesystem path. The distinction is syntactic: an entry is a path when it starts with `.` or `~`, or contains `/` or `\` — everything else must be a built-in name, so a bare `conductor` is never shadowed by a same-named local directory. A path points at either a single skill directory (one holding `SKILL.md`) or a root of them, which expands to every immediate child holding one (not recursive). Relative paths resolve against the **workflow file's directory**, the same rule `working_dir` uses, so a skill can be versioned alongside the workflow with no per-developer install step and the workflow behaves identically from any working directory. Skill paths are trusted input — no allowlist applies, since the same file can already run arbitrary shell via `type: script`.
+
+**`SKILL.md` frontmatter.** Every resolved skill must declare a non-empty `name` and `description` in valid YAML frontmatter. Use a block scalar whenever the text contains a colon followed by a space — `description: Does things. Triggers: a, b` is invalid YAML, and both the Copilot CLI and Claude Code skip such a skill *silently*. Conductor parses it and fails loudly instead, at validate time and at run time:
+
+```yaml
+---
+name: acme-widgets
+description: |
+  Internal ACME widget conventions. Triggers: widget, acme widget.
+---
+```
+
+**Tri-state per-agent field (resolved via list presence):**
+- Omit `skills:` — inherit from `runtime.skills`
+- `skills: []` — explicit opt-out (no skills for this agent, regardless of workflow default)
+- `skills: [name, ...]` — explicit set, replaces the workflow default
+
+**Workflow-wide default:** `runtime.skills: [conductor]` enables it for every provider-backed agent. Individual agents can override.
+
+**Provider mechanism (same observable contract — "the agent has access to the named skill"):**
+- **Copilot** — the resolved skill directory is registered on the SDK session via `skill_directories`, so the agent discovers and loads skill content natively (progressive disclosure via `SKILL.md` frontmatter). This is more token-efficient than eager injection.
+- **Claude Agent SDK** — also native, through the Claude Code plugin surface: the plugin owning the skill is registered on the session and the skill enabled by its `<plugin>:<skill>` name. Skills the workflow did not declare are suppressed, so `skills: []` really is an opt-out and ambient skills from the machine never load.
+- **Claude** and **hermes** — the loader reads `SKILL.md` plus every `references/*.md` file in the skill directory and prepends them to the agent's rendered prompt inside `<skills><skill name="...">...</skill></skills>` tags. Inserted between workspace instructions and the user prompt.
+
+**Two provider-specific limits worth knowing:**
+- `claude-agent-sdk` has **no bare skill-directory option** — a skill is enabled by name through the plugin that ships it. A path skill outside a Claude Code plugin is therefore rejected at validation time, with both remedies named (package it as a plugin, or run that agent on `copilot`, which accepts the identical skill untouched).
+- Eager injection has no progressive disclosure: the whole body is prepended on every call and every retry. The bundled `conductor` skill alone is ~117KB (~29K tokens). `runtime.skill_injection` bounds it — `warn_bytes` (default 64KB) warns, `max_bytes` (default 128KB) fails the agent, either can be `null` to disable. Providers with progressive disclosure are unaffected.
+
+Not allowed on `script`, `human_gate`, `workflow`, `wait`, `set`, or `terminate` agent types. Unknown built-in names fail when the config loads; unresolvable paths and malformed `SKILL.md` files fail at workflow validation time and again at run time.
+
+```yaml
+workflow:
+  runtime:
+    skills:
+      - conductor                   # built-in: ships in the wheel
+      - ./team-skills/acme-widgets  # path: versioned next to this workflow
+    skill_injection:                # only bounds eager-injection providers
+      warn_bytes: 65536
+      max_bytes: 131072
+    skill_discovery:                # off by default
+      sources: [personal, project]
+      exclude: [scratch-notes]
+
+agents:
+  - name: workflow_reviewer
+    skills: [conductor]             # explicit set, replaces the workflow default
+    prompt: "Review this workflow for correctness..."
+
+  - name: simple_agent
+    skills: []                      # opt out even when runtime default is set
+    prompt: "Do something simple."
+```
+
+**Discovering installed skills.** `runtime.skill_discovery` picks up skills already installed on the machine so a workflow need not enumerate a personal or team library. It is **off by default**, because an ambient set is the one part of a workflow the YAML does not capture — the same file can behave differently on a teammate's machine or in CI.
+
+Conductor scans the locations itself and unions both CLIs' conventions, rather than asking each provider to discover its own. That is the substance of the feature, not an implementation detail: discovery locations are provider-specific, so a per-provider flag would give a `copilot` agent and a `claude-agent-sdk` agent **different skill sets inside a single run**. Scanning centrally also keeps the providers' own discovery off, which matters because Copilot's would additionally auto-load MCP servers from any `.mcp.json` in the working directory.
+
+- `personal` → `~/.copilot/skills`, `~/.claude/skills`
+- `project` → `.github/skills` and `.claude/skills`, in the workflow file's directory and each ancestor up to the repository root
+
+Discovered skills join `runtime.skills`, so the tri-state is unchanged: an agent that declares its own `skills:` overrides discovery too. Sources are scanned in a fixed order (`project`, then `personal`) whatever order they are written in, so reordering cannot change which of two same-named skills wins. A skill named in `skills:` always beats a discovered one of the same name — which comes up immediately, since installing Conductor's own plugin puts a second `conductor` skill on the machine.
+
+Discovered content is held to a laxer standard than declared content: broken frontmatter, a taken name, an unreadable directory, or a skill `claude-agent-sdk` cannot load are all errors for a declared skill and warning-plus-skip for a discovered one. The exception is a provider with no native skill surface at all (`claude`, `hermes`), where skipping would drop the whole discovered set — that combination is an error either way. The author asked for one by name and not the other.
+
+Provider support is narrower than for declared skills. `copilot` is fully supported. `claude-agent-sdk` only loads a discovered skill that lives inside a Claude Code plugin, and most installed Copilot plugins are not — expect a warning per skipped skill, silenced with `exclude`. `claude` and `hermes` **reject discovery at validation time**: they inject every body into every prompt, and a discovered set is unbounded and machine-dependent, so no `skill_injection` limit makes it safe.
+
+Run `conductor validate` to see what discovery found — it lists every skill, the location it came from, and the total size if eagerly injected.
+
+There is deliberately no `plugins` source. Scanning a plugin's `skills/` reached into a plugin and took one of the three things it ships, leaving its subagents and MCP servers behind — the bug `runtime.plugins` exists to fix. Name plugins there instead; that brings the whole unit and, unlike a scan, reproduces on another machine.
+
+See `examples/skills-self-improving-workflow.yaml` and `examples/skills-discovery.yaml` for complete examples.
+
+## Plugins
+
+A skill is instructions. A **plugin** is the unit people install, and it ships up to three things Conductor uses: `skills/`, `agents/*.agent.md` subagents, and MCP servers declared in `.mcp.json` or the manifest. `runtime.plugins` (and per-agent `plugins:`) opts into all three, on the same tri-state as `skills:` — omitted inherits, `[]` opts out, a list overrides.
+
+```yaml
+runtime:
+  plugins:
+    - prs                    # installed plugin: everything it ships
+    - name: ./tools/mine     # path, relative to the workflow file
+      mcp: false             # skills and subagents only
+```
+
+Enabling all three matters because they are written together: a plugin's `SKILL.md` routinely tells the agent to dispatch to `prs:code-reviewer` or call an `ado` MCP tool. Loading only the instructions produces an agent that reads them correctly, reaches for something never registered, and says nothing — which is why every component defaults **on**.
+
+An entry is an installed plugin name (searched under `~/.copilot/installed-plugins/*/` and `~/.claude/plugins/*/`) or a path, classified syntactically exactly as `skills:` entries are. An uninstalled or ambiguous name is a hard error.
+
+`mcp: false` is the switch worth knowing: an MCP server is a subprocess launched with the user's credentials, started at session creation rather than at first tool call. `hooks/` and `commands/` are never loaded, and `conductor validate` warns when a plugin ships them.
+
+Supported on `copilot` and `claude-agent-sdk` only; `claude`, `hermes` and `aca` reject `plugins:` at validation time, since injecting text into a prompt cannot produce a subagent or an MCP server. Conductor deconstructs a plugin rather than registering its root, because both SDKs' whole-plugin surfaces are all-or-nothing — on Copilot, hiding an MCP tool does not stop its server launching. The one carve-out: on `claude-agent-sdk`, reaching a plugin's skills requires registering the root, which carries every subagent with it, so `agents: false` alongside `skills: true` is refused there.
+
+Plugins are never discovered — a plugin loads because a workflow named it. `conductor validate` prints what each contributes, including every subagent by name.
+
+See `examples/plugins.yaml` for a complete example.
+
+## Routing Patterns
+
+### Linear
+
+```yaml
+routes:
+  - to: next_agent
+```
+
+### Conditional (first match wins)
+
+```yaml
+routes:
+  - to: success_agent
+    when: "{{ output.status == 'approved' }}"
+  - to: failure_agent
+    when: "{{ output.status == 'rejected' }}"
+  - to: default_agent           # Fallback (no when clause)
+```
+
+### Loop-back
+
+```yaml
+routes:
+  - to: $end
+    when: "{{ output.score >= 90 }}"
+  - to: self                    # Loop back to same agent
+```
+
+### Terminal
+
+```yaml
+routes:
+  - to: $end                    # End workflow
+```
+
+### Route to parallel/for-each group
+
+```yaml
+routes:
+  - to: parallel_researchers    # Route to a parallel group
+  - to: item_processors         # Route to a for-each group
+```
+
+## Script Steps
+
+Script steps run shell commands and capture stdout, stderr, and exit_code:
+
+```yaml
+agents:
+  - name: check_python
+    type: script
+    description: Check the installed Python version
+    command: python3
+    args: ["--version"]
+    timeout: 30                  # Per-script timeout in seconds (optional)
+    working_dir: /tmp            # Working directory (optional, Jinja2 templated)
+    env:                         # Extra environment variables (optional)
+      MY_VAR: "value"
+    stdin: "{{ data | tojson }}" # Payload piped to the child's stdin (optional, Jinja2 templated)
+    routes:
+      - to: analyzer
+        when: "exit_code == 0"
+      - to: error_handler
+```
+
+Use `stdin:` to hand large or structured payloads to a script without hitting OS command-line length limits (notably Windows's ~32 KB command-line cap). It is a Jinja2 string template rendered to the child's stdin as UTF-8 — use `{{ x | tojson }}` for JSON, or render text directly. Omitting it inherits the parent's stdin (legacy behavior); `stdin` and `args` can be set together (orthogonal).
+
+### Script Output
+
+Script steps always produce three fields:
+
+```jinja2
+{{ script_name.output.stdout }}     # Captured standard output (string)
+{{ script_name.output.stderr }}     # Captured standard error
+{{ script_name.output.exit_code }}  # Process exit code (0 = success)
+```
+
+If `stdout` is **valid JSON**, its top-level keys are auto-merged into the agent's output dict alongside `stdout`/`stderr`/`exit_code`. This enables structured `when:` route conditions instead of opaque exit-code matching:
+
+```yaml
+agents:
+  - name: classify
+    type: script
+    command: python3
+    args: ["classify.py"]                # prints e.g. {"category": "bug", "score": 87}
+    routes:
+      - to: bug_handler
+        when: "category == 'bug'"        # field-based, not exit-code-based
+      - to: triage
+```
+
+### Script Routing
+
+Route conditions use `exit_code` directly (simpleeval syntax):
+
+```yaml
+routes:
+  - to: next_step
+    when: "exit_code == 0"
+  - to: error_handler            # Fallback for non-zero exit
+```
+
+### Script Restrictions
+
+Script agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `output`, `system_prompt`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `timeout_seconds` (use `timeout:` instead), `input_mapping`, or `max_depth`.
+Command and args support Jinja2 templating for dynamic values.
+
+## Wait Steps (`type: wait`)
+
+Pause workflow execution for a parsed duration via in-process `asyncio.sleep`. Cross-platform — no shell `sleep` dependency. Use for rate-limit cooldowns, polling intervals, and external-system catch-up.
+
+```yaml
+agents:
+  - name: cooldown
+    type: wait
+    description: Cool down between API bursts   # Optional
+    duration: 60s                               # Required (see "Duration format")
+    reason: Avoiding rate limit                 # Optional, shown in dashboard
+    routes:
+      - to: next_call
+```
+
+### Duration Format
+
+- Plain `int`/`float` → seconds (e.g. `60`, `1.5`).
+- Suffixed string: `ms`, `s`, `m`, `h` (e.g. `"500ms"`, `"60s"`, `"2.5m"`, `"1h"`).
+- Jinja2 template rendering to one of the above (templates defer literal validation to runtime):
+  ```yaml
+  duration: "{{ workflow.input.poll_interval_seconds }}s"
+  ```
+- Must resolve to `> 0` and `≤ 86400s` (24h). Booleans are rejected.
+
+### Wait Output
+
+Strict — only one field:
+
+```jinja2
+{{ wait_name.output.waited_seconds }}   # Actual seconds slept (may be < requested on interrupt)
+```
+
+### Polling Loop-back Pattern
+
+```yaml
+agents:
+  - name: check_status
+    type: script
+    command: ./poll-status.sh
+    routes:
+      - to: process_result
+        when: "status == 'ready'"
+      - to: wait_then_retry
+
+  - name: wait_then_retry
+    type: wait
+    duration: "{{ workflow.input.poll_interval_seconds }}s"
+    routes:
+      - to: check_status                  # loop back
+
+  - name: process_result
+    # ...
+```
+
+### Wait Cancellation
+
+- `Esc` / `Ctrl+G` cancels in-progress waits immediately (the engine races the sleep against the interrupt event).
+- Workflow-level `limits.timeout_seconds` cancels in-flight waits via the standard timeout path.
+
+### Wait Restrictions
+
+Wait agents **cannot** have: `prompt`, `model`, `provider`, `tools`, `system_prompt`, `options`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `input_mapping`, `max_depth`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, or `output`. They also cannot be used inside `parallel` groups or `for_each` groups.
+
+See `examples/wait-step.yaml` for a complete polling workflow.
+## Set Steps
+
+Set steps evaluate one or more Jinja2 expressions and bind the typed results into context. No LLM call, no subprocess, no I/O — these are pure context transformations. Use them when you'd otherwise duplicate a Jinja expression across many prompts, run `echo`-only script steps, or burn a model call on something deterministic.
+
+```yaml
+agents:
+  # Single binding: output is the typed scalar / list / dict.
+  - name: compute_slug
+    type: set
+    value: "{{ workflow.input.org }}/{{ workflow.input.repo }}"
+    routes:
+      - to: derive_flags
+
+  # Multi-binding: output is a dict, accessible as step.output.<key>.
+  - name: derive_flags
+    type: set
+    values:
+      is_breaking: "{{ research.output.severity in ['high', 'critical'] }}"
+      target_branch: "{{ workflow.input.branch or 'main' }}"
+      effective_model: "{{ workflow.input.model or 'claude-sonnet-4-5' }}"
+    routes:
+      - to: breaking_path
+        when: "{{ output.is_breaking }}"
+      - to: safe_path
+```
+
+Exactly one of `value:` / `values:` must be present.
+
+### Type Detection
+
+Default (auto) detection uses safe YAML loading: booleans, numbers, lists, and dicts become native Python types; date-like strings are converted to ISO 8601 to stay JSON-safe; parse failures fall back to the raw string; empty renders become `""` (not `None`). Override with `output_type:` on a single `value:` to force `string`, `number`, `integer`, `boolean`, `list`, or `dict`. Per-key typing on `values:` is not supported — chain steps if you need it.
+
+### Multi-Binding Ordering
+
+Every binding in a single `values:` step renders against the *original* pre-step context. Later bindings cannot reference earlier ones in the same step. Chain multiple set steps for ordered dependencies:
+
+```yaml
+- name: step_a
+  type: set
+  value: "{{ workflow.input.x | upper }}"
+- name: step_b
+  type: set
+  value: "{{ step_a.output }}-suffix"
+```
+
+### Routing on Set Output
+
+Routes attached to a set step see the bound value directly. Dict outputs expose `{{ output.<key> }}` (Jinja2) and bare `<key>` (simpleeval); scalar / list outputs expose only `{{ output }}`:
+
+```yaml
+# Multi-values: route on a derived dict field.
+- name: derive_flags
+  type: set
+  values:
+    is_breaking: "{{ severity == 'high' }}"
+  routes:
+    - to: hot_path
+      when: "{{ output.is_breaking }}"
+    - to: safe_path
+
+# Single-value: route on the scalar itself.
+- name: flag
+  type: set
+  value: "{{ workflow.input.severity == 'high' }}"
+  routes:
+    - to: hi
+      when: "{{ output }}"
+    - to: lo
+```
+
+### Set Step Composition
+
+- Inside `parallel` groups: each member publishes its bound value to context. Templates cannot reference sibling group members (validator-enforced).
+- Inside `for_each` as the inline agent: one bound value per item, accessible via `loop.outputs`.
+- Output `value:` / `values:` chain naturally — a multi-binding step that publishes `items` can drive a downstream `for_each` whose `source:` is `step.output.items`.
+
+### Set Step Restrictions
+
+Set agents **cannot** have: `prompt`, `provider`, `model`, `tools`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `workflow`, `options`, `input_mapping`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, or `session_key`. They count toward `limits.max_iterations` like any other step.
+
+`output:` schema validation is permitted only when the rendered output is a dict (always for `values:`, sometimes for `value:`). A single-`value:` step with a declared schema that produces a scalar raises a `ValidationError` pointing to `values:`.
+
+## MCP Steps (`type: mcp`)
+
+Directly invoke tools on configured MCP servers (`workflow.runtime.mcp_servers`) without an LLM. MCP steps run deterministically, spend zero prompt tokens, and capture structured output into the workflow context.
+
+```yaml
+agents:
+  - name: read_spec
+    type: mcp
+    server: filesystem                      # Required: literal server name in runtime.mcp_servers
+    tool: read_file                         # Required: literal tool name on the server
+    arguments:                              # Optional: dict of Jinja2-templated arguments
+      path: "docs/spec.md"
+    timeout: 30                             # Optional: per-call timeout in seconds
+    routes:
+      - to: handle_error
+        when: "{{ output.is_error }}"
+      - to: analyze_spec
+```
+
+### Argument Rendering and Type Coercion
+
+Dict and list structures in `arguments:` are traversed recursively. String leaves are Jinja2-rendered against workflow context, and each **fully rendered string** is then YAML-parsed (the `set` step's `auto` rule) — whatever the rendered text parses as becomes the argument value: `"105"` -> `105`, `"true"` -> `True`, `"null"` -> `None`, and also collections (`"[1, 2]"` -> a list, `"a: 1"` -> a mapping). This applies to templates too: `"1{{ x }}"` with `x=2` renders `"12"` and becomes the integer `12`; only renders whose text parses as a plain string (e.g. `"pre-{{ x }}"` -> `"pre-2"`, multi-word prose) stay strings. YAML-native scalars (integers, floats, booleans, `None`) pass through untouched. Quote and type-check values where the exact type matters.
+
+### Output Envelope and Merging
+
+MCP steps produce an output envelope:
+
+```json
+{
+  "content": [
+    {"type": "text", "text": "..."}
+  ],
+  "structured": {"record_id": 42, "status": "ok"},
+  "is_error": false
+}
+```
+
+When `structured` is a dictionary, its top-level keys are merged onto the step output dict. Reserved keys are never overridden by the merge: the envelope's own `content`, `structured`, `is_error`, plus `outputs` and `errors` (the workflow engine duck-types parallel/for-each group outputs by those two keys — a structured result flattening them would corrupt how the step's output is addressed downstream). Colliding structured keys are dropped with a debug-level log and stay reachable under `output.structured.<key>`.
+
+### Error Handling and `is_error` Routing
+
+Logical tool errors reported by the server set `output.is_error = True` and complete the step normally without raising an error, enabling conditional routing:
+
+```yaml
+routes:
+  - to: handle_error
+    when: "{{ output.is_error }}"
+  - to: next_step
+```
+
+Transport failures, unlisted tools, unknown servers, timeouts, and output schema validation failures raise exceptions and fail the step.
+
+### Concurrency and Server Serialization
+
+Calls to the same MCP server process are serialized via a per-server slot lock. Calls to distinct MCP servers in parallel groups run concurrently.
+
+### MCP Step Restrictions
+
+MCP agents **cannot** have: `prompt`, `system_prompt`, `provider`, `model`, `tools`, `reasoning`, `context_tier`, `skills`, `plugins`, `validator`, `dialog`, `sandbox`, `session_key`, `max_agent_iterations`, `max_session_seconds`, `output_mode`, `retry`, `timeout_seconds` (use `timeout`), `command`, `args`, `env`, `working_dir`, `settings_dir`, `options`, `workflow`, `input_mapping`, `max_depth`, `value`, `values`, or `output_type`.
+
+MCP steps currently support `stdio` servers only.
+
+## Sub-Workflow Agents (`type: workflow`)
+
+Reference an external workflow YAML file as a black-box step. The sub-workflow runs with its own engine and inherits the parent's provider configuration.
+
+```yaml
+agents:
+  - name: deep_research
+    type: workflow
+    workflow: ./research-pipeline.yaml   # Required: path resolved relative to parent YAML
+    input:                               # Optional: explicit input declarations (for explicit context mode)
+      - workflow.input.topic
+    input_mapping:                       # Optional: per-call inputs to the sub-workflow
+      topic: "{{ workflow.input.topic }}"
+      depth: "{{ research_planner.output.depth }}"
+    max_depth: 3                         # Optional per-agent recursion cap
+                                         #   (additionally bounded by global MAX_SUBWORKFLOW_DEPTH = 10)
+    output:                              # Optional output schema for validation
+      findings:
+        type: string
+    routes:
+      - to: synthesizer
+```
+
+**Semantics:**
+
+- `workflow` path is resolved relative to the parent workflow file.
+- Sub-workflow inherits the parent's provider configuration.
+- When `input_mapping` is omitted, the parent's `workflow.input.*` is forwarded as-is.
+- `input_mapping` keys are sub-workflow input names; values are Jinja2 expressions evaluated against the parent's context.
+- Recursive composition is supported with a global `MAX_SUBWORKFLOW_DEPTH = 10`. Self-referential workflows are allowed; bound recursion further with `max_depth`.
+- Each invocation emits `subworkflow_started` / `subworkflow_completed` events. The dashboard supports breadcrumb navigation and double-click dive-in.
+- Sub-workflow output is accessible via `{{ agent_name.output.field }}`.
+
+**Sub-workflows in `for_each` groups** — `type: workflow` agents work inside `for_each` groups for dynamic fan-out, with per-iteration `input_mapping` evaluated against the loop variable:
+
+```yaml
+for_each:
+  - name: plan_issues
+    type: for_each
+    source: epic_planner.output.issues
+    as: issue
+    max_concurrent: 1
+    agent:
+      type: workflow
+      workflow: ./plan-and-review.yaml
+      input_mapping:
+        work_item_id: "{{ issue.id }}"
+        title: "{{ issue.title }}"
+```
+
+**Restrictions** — workflow steps cannot have `prompt`, `model`, `provider`, `tools`, `system_prompt`, `command`, `options`, `retry`, `reasoning`, `dialog`, `validator`, `max_session_seconds`, `max_agent_iterations`, `session_key`, or `timeout_seconds`.
+
+## Terminate Steps (`type: terminate`)
+
+End the workflow with an explicit, structured outcome — distinguishable from a generic crash in CLI exit codes, dashboard state, and event logs. Real workflows have multiple legitimate end states beyond "the last agent finished": early success ("the document is already up to date"), soft abort ("no matching issues found"), hard failure with reason ("upstream service returned unprocessable data"), pre-condition not met ("this PR is from a fork"). With only `$end`, all of these collapse into "workflow completed" downstream. Terminate steps surface the distinction.
+
+```yaml
+agents:
+  - name: precheck
+    prompt: "Is the input safe to process? Return JSON: {safe: bool, reason: string}"
+    output:
+      safe:   { type: boolean }
+      reason: { type: string }
+    routes:
+      - when: "not precheck.output.safe"
+        to: abort_unsafe
+      - to: main_pipeline
+
+  - name: abort_unsafe
+    type: terminate
+    status: failed                     # success | failed (required)
+    reason: "{{ precheck.output.reason }}"   # required; Jinja2-templated
+    output_template:                   # optional; replaces workflow-level output:
+      aborted: "true"                  # rendered then JSON-coerced ("true" -> True)
+      stage: precheck
+      reason: "{{ precheck.output.reason }}"
+```
+
+**Semantics:**
+
+- Reaching a terminate step ends the workflow immediately — no routes evaluated after.
+- `status: success` → engine returns the rendered output, CLI exits `0`, dashboard ✅, emits `workflow_completed { termination_reason, terminated_by, is_explicit: true, status: "success" }`.
+- `status: failed` → engine raises `WorkflowTerminated` (subclass of `ExecutionError`), CLI exits `1` (and still prints the rendered output JSON to stdout for downstream tooling), dashboard ❌, emits `workflow_failed { error_type: "WorkflowTerminated", termination_reason, terminated_by, is_explicit: true, status: "failed", output }`. **Intentionally not resumable** — the engine skips the on-failure checkpoint because the author explicitly chose this outcome.
+- `output_template:` is a `dict[str, str]` where each value is a Jinja2 expression. The rendered values are passed through the engine's JSON-coercion helper, so `"true"` becomes `True`, `"42"` becomes `42`, and JSON literals (`'{"k":"v"}'`) are parsed. When omitted, the workflow-level `output:` mapping is rendered as on any other terminal path.
+- **Sub-workflow boundary** — a `status: failed` terminate inside a child sub-workflow is downgraded to `SubworkflowTerminatedError` (also an `ExecutionError`) at the parent boundary. The parent treats it as a normal sub-workflow failure (its own `workflow_failed` does NOT inherit `is_explicit: true`). The child's rendered output, reason, and terminate-step name are preserved as `terminated_output` / `terminated_reason` / `terminated_by` attributes on the wrapper for debugging surfaces .A `status: success` child terminate returns its rendered output cleanly and the parent continues with its next routes.
+- **Branching on a child's termination** — if the parent's routes need to react to a child's outcome, the child should use `status: success` plus an `output_template:` carrying the relevant fields. Failed terminate is an error from the parent's perspective; parent `routes:` are only evaluated after successful steps.
+
+**Restrictions** — terminate steps cannot have `routes`, `tools`, `output`, `prompt`, `model`, `provider`, `system_prompt`, `command`, `args`, `env`, `working_dir`, `timeout`, `timeout_seconds`, `max_session_seconds`, `max_agent_iterations`, `session_key`, `max_depth`, `retry`, `dialog`, `validator`, `reasoning`, `workflow`, `input_mapping`, or `options`. Cannot appear as a parallel-group member or as a `for_each` inline agent — route to them from those groups' `routes:` instead. Conversely, regular agents cannot have `status`, `reason`, or `output_template` — those fields are rejected at schema validation to catch authors who forgot to add `type: terminate`.
+
+See `examples/terminate.yaml` for a complete example demonstrating success, failure, and pass-through paths.
+
+## Dialog Mode
+
+Dialog mode lets an agent conditionally pause after execution and enter a free-form conversation with the user. A lightweight evaluator LLM call inspects the agent's output against `trigger_prompt` and decides whether to engage. Both Copilot and Claude providers are supported, and the dashboard provides dedicated UI (`DialogDetail`, `DialogEngagementPrompt`, `DialogOverlay`).
+
+```yaml
+agents:
+  - name: researcher
+    prompt: "Research the given topic thoroughly"
+    dialog:
+      trigger_prompt: |
+        Enter dialog if the agent expresses uncertainty about
+        the user's intent, encounters ambiguous requirements,
+        or needs clarification before proceeding.
+        Do NOT trigger for minor uncertainties the agent can resolve on its own.
+      conversation_prompt: |
+        Ask one question at a time and offer a recommended answer with each.
+        Let the user decide when the conversation is over.
+    routes:
+      - to: writer
+```
+
+`trigger_prompt` reaches only the evaluator that decides whether to open the dialog. `conversation_prompt` (optional) is the one field that reaches the agent holding the conversation; it is appended to the built-in dialog system prompt and takes precedence over its rules where they conflict.
+
+Only valid on provider-backed agents (not `script`, `human_gate`, `workflow`, or `wait`). See `examples/dialog-mode.yaml` for a complete example.
+
+## Workflow Metadata and Workspace Instructions
+
+### Metadata
+
+Attach arbitrary key-value metadata to a workflow for downstream tooling (dashboards, work-item trackers, audit logs). Surfaced in the `workflow_started` event payload.
+
+```yaml
+workflow:
+  name: implement
+  metadata:
+    tracker: ado
+    template_version: 3
+```
+
+CLI metadata is merged on top of YAML metadata (CLI wins on key collision; values stay as strings, no type coercion):
+
+```bash
+conductor run workflow.yaml -m work_item_id=1814 -m sprint=Q3
+```
+
+### Workspace Instructions
+
+Prepend workspace context to every agent prompt. Three options:
+
+1. **YAML `instructions:`** — first-class field, persisted in checkpoints, inherited into sub-workflows. Best for self-contained workflows where the YAML lives alongside the code.
+
+   ```yaml
+   workflow:
+     instructions:
+       - !file ../AGENTS.md
+       - "Always respond in English."
+   ```
+
+2. **`--workspace-instructions` CLI flag** — auto-discovers files by walking from CWD to the git root: `AGENTS.md`, `CLAUDE.md`, `.github/copilot-instructions.md`, and `.github/instructions/**/*.instructions.md` (only files with `applyTo: "**"` in YAML frontmatter; scoped or absent-`applyTo` files are skipped per the GitHub Copilot convention). Best for workflows distributed via registry/skills where the YAML lives far from the target repo.
+
+3. **`--instructions PATH` CLI flag** — explicit path to a file (repeatable).
+
+All three sources are concatenated and prepended to every agent's prompt as a workspace preamble.
+
+## File Includes (`!file` and `!yamlfile` Tags)
+
+Include external file content in YAML using the `!file` tag for text, or `!yamlfile` for structured data:
+
+```yaml
+agents:
+  - name: analyzer
+    system_prompt: !file prompts/system.md
+    prompt: !file prompts/analyze.md
+    output: !yamlfile schemas/analyzer-output.yaml
+```
+
+- Paths are **relative to the YAML file's directory**
+- `!file` always returns the file's content verbatim as a string, whatever it contains
+- `!yamlfile` parses the file as YAML and returns a dict/list; it raises a `ConfigurationError` if the file is not valid YAML rather than falling back to a string
+- Only `!yamlfile` **recurses**: an included YAML file can itself use `!file`/`!yamlfile`. `!file` never parses its own content, so it cannot recurse
+- Circular `!yamlfile` references are detected and raise an error
+
+Prompt files loaded via `!file` may also use Jinja loader-dependent tags
+(`{% include %}`, `{% import %}`, `{% extends %}`); relative paths resolve
+against the prompt file's own directory. `${VAR}` / `${VAR:-default}`
+references inside those partials resolve at render time with the same
+semantics as the root prompt file — an unset required variable fails the run
+with a configuration error. The prompt file must still exist at run time:
+if it was deleted after loading, rendering fails with an explicit error
+naming the missing source path (it never silently falls back to inline
+rendering).
+
+## Parallel Groups
+
+Static parallel groups run a fixed set of agents concurrently:
+
+```yaml
+parallel:
+  - name: parallel_researchers
+    description: Research from multiple sources
+    agents:
+      - web_researcher           # At least 2 agents required
+      - academic_researcher
+      - news_researcher
+    failure_mode: continue_on_error  # fail_fast, continue_on_error, all_or_nothing
+    routes:
+      - to: synthesizer
+```
+
+### Context Isolation
+
+Each parallel agent gets an **immutable snapshot** of context at group start. Agents cannot see each other's outputs during execution.
+
+### Accessing Parallel Outputs
+
+```jinja2
+{{ parallel_researchers.outputs.web_researcher.summary }}
+{{ parallel_researchers.outputs.academic_researcher.findings }}
+
+# Error access (continue_on_error mode)
+{% if parallel_researchers.errors %}
+{{ parallel_researchers.errors.news_researcher.message }}
+{% endif %}
+```
+
+### Failure Modes
+
+| Mode | Behavior |
+|------|----------|
+| `fail_fast` | Stop immediately on first failure (default) |
+| `continue_on_error` | Continue all; proceed if at least one succeeds |
+| `all_or_nothing` | Continue all; fail if any agent fails |
+
+## For-Each Groups
+
+Dynamic parallel groups process variable-length arrays at runtime:
+
+```yaml
+for_each:
+  - name: kpi_analyzers
+    type: for_each                 # Required discriminator
+    description: Analyze each KPI
+    source: finder.output.kpis     # Array reference (dotted path, 3+ parts)
+    as: kpi                        # Loop variable name
+    max_concurrent: 5              # Batch size (default: 10, max: 100)
+    failure_mode: continue_on_error
+
+    agent:                         # Inline agent template
+      name: kpi_analyzer
+      model: claude-sonnet-4.5
+      prompt: |
+        Analyze KPI {{ _index + 1 }}: {{ kpi.name }}
+        Value: {{ kpi.value }}
+      output:
+        analysis:
+          type: string
+        score:
+          type: number
+
+    key_by: kpi.kpi_id             # Optional: dict-based outputs
+
+    routes:
+      - to: aggregator
+```
+
+### Loop Variables
+
+| Variable | Description |
+|----------|-------------|
+| `{{ kpi }}` | Current item (name from `as`) |
+| `{{ _index }}` | Zero-based index (0, 1, 2...) |
+| `{{ _key }}` | Extracted key (only with `key_by`) |
+
+### Reserved Variable Names
+
+Cannot use for `as`: `workflow`, `context`, `output`, `_index`, `_key`
+
+### Accessing For-Each Outputs
+
+```jinja2
+# Array access (no key_by)
+{{ kpi_analyzers.outputs[0].analysis }}
+{% for result in kpi_analyzers.outputs %}
+- Score: {{ result.score }}
+{% endfor %}
+
+# Dict access (with key_by)
+{{ kpi_analyzers.outputs["KPI-123"].analysis }}
+
+# Metadata
+Total: {{ kpi_analyzers.outputs | length }}
+Errors: {{ kpi_analyzers.errors | length }}
+```
+
+## Human Gates
+
+Pause workflow for user decisions. Uses **list-based** options:
+
+```yaml
+agents:
+  - name: approval_gate
+    type: human_gate
+    prompt: |
+      Review the design:
+      {{ designer.output.design }}
+    options:
+      - label: "Approve"
+        value: approved
+        route: $end
+      - label: "Request Changes"
+        value: changes
+        route: designer
+        prompt_for: feedback        # Collects text input from user
+      - label: "Reject"
+        value: rejected
+        route: $end
+```
+
+### Gate Output
+
+Human gates automatically capture:
+- `output.selected` — the `value` of the chosen option.
+- `output.additional_input` — dict of values collected from `prompt_for` fields.
+  Always present; `{}` when no `prompt_for` was specified or the selected option
+  has no `prompt_for`. Access individual fields via templates as
+  `{{ <gate>.output.additional_input.<field> }}` (for example
+  `{{ approval_gate.output.additional_input.feedback }}` when an option declares
+  `prompt_for: feedback`).
+
+> **`context: explicit` mode note.** `input:` declarations support
+> `<gate>.output.additional_input` (the whole dict) but not the dotted shorthand
+> `<gate>.output.additional_input.<field>`. Declare the parent key and read
+> individual fields via Jinja2 in the agent's prompt or output template.
+
+## Context Modes
+
+### Accumulate (default)
+
+All prior agent outputs available to all agents:
+
+```yaml
+context:
+  mode: accumulate
+```
+
+### Last Only
+
+Only the previous agent's output available:
+
+```yaml
+context:
+  mode: last_only
+```
+
+### Explicit
+
+Only specified inputs available — maximum control, minimal tokens:
+
+```yaml
+context:
+  mode: explicit
+
+agents:
+  - name: agent
+    input:
+      - workflow.input.question
+      - other_agent.output.result        # Required field
+      - other_agent.output.nested.field  # Nested projection (deep path)
+      - optional_agent.output?           # Optional (? suffix)
+```
+
+### Context Compaction
+
+A single agent execution with a multi-turn tool loop (for example, many MCP tool calls returning large payloads) can grow the provider's message history until it approaches the model's context window. To prevent this, Conductor features automatic, always-on client-side context compaction for `claude` and `openai` providers. When the history size crosses a computed trigger threshold (based on context window and output limits), Conductor condenses the conversation:
+
+1.  **Clear Tool Results:** Older tool call and return pairs are truncated.
+2.  **Summarize History:** Older messages are replaced with a summary generated by a nested model call.
+3.  **Sliding Window:** Oldest messages are discarded as a final fallback.
+
+Compaction operates on the message history within a single agent execution. Loop-back routing does NOT accumulate provider history — each execution starts a fresh model session, so context `mode: accumulate` (which only accumulates *workflow* outputs across steps) is not a way to grow into the trigger. The feature matters for agents whose own tool loops are long.
+
+Each summarizing compaction step consumes one request slot from the agent's `max_agent_iterations` budget. If compaction is expected, ensure `max_agent_iterations` is set high enough (at least 5).
+
+No extra YAML configuration is required, and there is no user-facing context window override.
+
+## Multi-Provider Workflows
+
+Override the provider on individual agents:
+
+```yaml
+workflow:
+  runtime:
+    provider: copilot              # Default provider
+    default_model: gpt-5.2
+
+agents:
+  - name: fast_classifier
+    provider: claude               # Uses Claude for this agent
+    model: claude-haiku-4.5
+    prompt: "Classify: {{ workflow.input.text }}"
+
+  - name: tool_using_agent
+    provider: hermes               # Uses Hermes (NousResearch agent SDK)
+    model: anthropic/claude-sonnet-4
+    prompt: "Use tools to research: {{ workflow.input.topic }}"
+
+  - name: deep_analyzer
+    # Uses default copilot provider
+    model: gpt-5.2
+    prompt: "Analyze: {{ fast_classifier.output.category }}"
+```
+
+## MCP Server Configuration
+
+### Stdio server
+
+```yaml
+runtime:
+  mcp_servers:
+    web-search:
+      command: npx
+      args: ["-y", "open-websearch@latest"]
+      tools: ["*"]
+```
+
+### HTTP/SSE server
+
+```yaml
+runtime:
+  mcp_servers:
+    remote:
+      type: http                   # or "sse"
+      url: https://mcp.server.example.com/
+      headers:
+        Authorization: "Bearer ${API_TOKEN}"
+      tools: ["*"]
+```
+
+### With environment variables
+
+```yaml
+runtime:
+  mcp_servers:
+    custom:
+      command: node
+      args: ["./server.js"]
+      env:
+        API_KEY: "${API_KEY}"      # Resolved from environment at runtime
+      tools: ["*"]
+```
+
+### Selective tool access
+
+```yaml
+tools: ["search", "fetch"]        # Only these tools available
+```
+
+## Template Variables (Jinja2)
+
+| Variable | Description |
+|----------|-------------|
+| `{{ workflow.input.param }}` | Workflow input |
+| `{{ workflow.name }}` | Workflow name |
+| `{{ workflow.dir }}` | Directory of the workflow YAML file (always available, all context modes) |
+| `{{ workflow.file }}` | Absolute path to the workflow YAML file |
+| `{{ agent_name.output.field }}` | Agent output |
+| `{{ output.field }}` | Current agent output (in routes) |
+| `{{ group.outputs.agent.field }}` | Parallel group output |
+| `{{ group.outputs[i].field }}` | For-each output (index) |
+| `{{ group.outputs["key"].field }}` | For-each output (key_by) |
+
+### Conditionals
+
+```jinja2
+{% if previous_agent is defined and previous_agent.output %}
+Previous: {{ previous_agent.output.result }}
+{% endif %}
+```
+
+### Loops
+
+```jinja2
+{% for item in agent.output.items %}
+- {{ item }}
+{% endfor %}
+```
+
+### Filters
+
+```jinja2
+{{ value | upper }}                 # Uppercase
+{{ value | default("fallback") }}   # Default value
+{{ items | join(", ") }}            # Join array
+{{ data | json }}                   # JSON serialize
+{{ text | fromjson }}               # Parse a JSON string into native data
+```
+
+## Output Schema
+
+Map agent outputs to workflow output:
+
+```yaml
+output:
+  answer: "{{ answerer.output.answer }}"
+  summary: "{{ reviewer.output.summary }}"
+  results: "{{ processors.outputs | json }}"
+```
+
+## Output Types
+
+### String
+
+```yaml
+output:
+  answer:
+    type: string
+    description: The answer
+```
+
+### Number
+
+```yaml
+output:
+  score:
+    type: number
+    description: Quality score 0-100
+```
+
+### Boolean
+
+```yaml
+output:
+  approved:
+    type: boolean
+```
+
+### Array
+
+```yaml
+output:
+  items:
+    type: array
+    description: List of items
+    items:
+      type: string
+```
+
+### Object
+
+```yaml
+output:
+  result:
+    type: object
+    properties:
+      name:
+        type: string
+      count:
+        type: number
+```
+
+## Route Conditions
+
+### Comparison operators
+
+```yaml
+when: "{{ output.score >= 90 }}"
+when: "{{ output.score < 50 }}"
+when: "{{ output.status == 'done' }}"
+when: "{{ output.status != 'error' }}"
+```
+
+### Logical operators
+
+```yaml
+when: "{{ output.score >= 90 and output.approved }}"
+when: "{{ output.retry or output.force }}"
+when: "{{ not output.failed }}"
+```
+
+### String operations
+
+```yaml
+when: "{{ 'error' in output.message }}"
+when: "{{ output.status.startswith('success') }}"
+```
+
+## Common Patterns
+
+### Single Agent Q&A
+
+```yaml
+workflow:
+  name: qa
+  entry_point: answerer
+  input:
+    question:
+      type: string
+      required: true
+
+agents:
+  - name: answerer
+    prompt: |
+      Answer: {{ workflow.input.question }}
+    output:
+      answer:
+        type: string
+    routes:
+      - to: $end
+
+output:
+  answer: "{{ answerer.output.answer }}"
+```
+
+### Iterative Refinement
+
+```yaml
+workflow:
+  name: refine
+  entry_point: creator
+  limits:
+    max_iterations: 5
+
+agents:
+  - name: creator
+    prompt: |
+      Create content...
+      {% if reviewer.output %}
+      Feedback: {{ reviewer.output.feedback }}
+      {% endif %}
+    routes:
+      - to: reviewer
+
+  - name: reviewer
+    prompt: |
+      Review and score 0-100:
+      {{ creator.output.content }}
+    output:
+      score:
+        type: number
+      feedback:
+        type: string
+    routes:
+      - to: $end
+        when: "{{ output.score >= 90 }}"
+      - to: creator
+```
+
+### Parallel Research Pipeline
+
+```yaml
+workflow:
+  name: research
+  entry_point: planner
+  context:
+    mode: explicit
+
+parallel:
+  - name: researchers
+    agents: [web_researcher, academic_researcher]
+    failure_mode: continue_on_error
+    routes:
+      - to: synthesizer
+
+agents:
+  - name: planner
+    routes:
+      - to: researchers
+
+  - name: web_researcher
+    input: [planner.output]
+    prompt: "Web research on {{ planner.output.topic }}"
+
+  - name: academic_researcher
+    input: [planner.output]
+    prompt: "Academic research on {{ planner.output.topic }}"
+
+  - name: synthesizer
+    input: [researchers.outputs]
+    prompt: "Synthesize: {{ researchers.outputs | json }}"
+    routes:
+      - to: $end
+```
+
+### Human Approval Loop
+
+```yaml
+agents:
+  - name: designer
+    routes:
+      - to: approval
+
+  - name: approval
+    type: human_gate
+    prompt: "Review: {{ designer.output.summary }}"
+    options:
+      - label: Approve
+        value: approved
+        route: $end
+      - label: Revise
+        value: changes
+        route: designer
+        prompt_for: feedback
+```
+
+## Validation Rules
+
+- `entry_point` must reference a valid agent, parallel group, or for-each group
+- All agents must be reachable from entry_point
+- All paths must eventually reach `$end`
+- Route `when` conditions must be valid Jinja2
+- Agent names must be unique
+- Non-gate agents require at least one route
+- Parallel groups need at least 2 agents
+- For-each `source` must be dotted path with 3+ parts
+- For-each `as` cannot use reserved names

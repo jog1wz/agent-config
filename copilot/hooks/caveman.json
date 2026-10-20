@@ -1,0 +1,13 @@
+{
+  "version": 1,
+  "hooks": {
+    "sessionStart": [
+      {
+        "type": "command",
+        "bash": "node '__HOME__/.copilot/caveman/hooks/caveman-host-session-start.js' copilot",
+        "powershell": "node \"__HOME__/.copilot/caveman/hooks/caveman-host-session-start.js\" copilot",
+        "timeoutSec": 10
+      }
+    ]
+  }
+}
